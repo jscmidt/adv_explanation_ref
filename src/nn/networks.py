@@ -4,6 +4,7 @@ from .enums import LRPRule, ExplainingMethod
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torchvision
 
 
 class ExplainableNet(nn.Module):
@@ -33,18 +34,21 @@ class ExplainableNet(nn.Module):
     def fill_layers(self, model):
         lrp_rule = self.lrp_rule_first_layer
 
-        for layer in model.features:
-            new_layer = self.create_layer(layer, lrp_rule)
-            if new_layer == 0:
-                continue
-            self.layers.append(new_layer)
-            lrp_rule = self.lrp_rule_next_layers
-
-        for layer in model.classifier:
-            new_layer = self.create_layer(layer, lrp_rule)
-            if new_layer == 0:
-                continue
-            self.layers.append(new_layer)
+        if isinstance(model, torchvision.models.VGG):
+            for layer in model.features:
+                new_layer = self.create_layer(layer, lrp_rule)
+                if new_layer is None:
+                    continue
+                self.layers.append(new_layer)
+                lrp_rule = self.lrp_rule_next_layers
+            for layer in model.classifier:
+                new_layer = self.create_layer(layer, lrp_rule)
+                if new_layer is None:
+                    continue
+                self.layers.append(new_layer)
+        
+        elif isinstance(model, torchvision.models.MaxVit):
+            self.layers.append(model)
 
     def create_layer(self, layer, lrp_rule):
         if type(layer) == torch.nn.Conv2d:
@@ -74,7 +78,7 @@ class ExplainableNet(nn.Module):
             new_layer = layer
 
         elif type(layer) == nn.ReLU:
-            return 0
+            return None
 
         else:
             print('ERROR: unknown layer')
@@ -91,7 +95,7 @@ class ExplainableNet(nn.Module):
 
     def forward(self, x):
         for layer in self.layers:
-            x = layer.forward(x)
+            x = layer(x)
 
         self.R = x
 

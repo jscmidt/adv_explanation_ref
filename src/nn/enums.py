@@ -15,3 +15,4 @@ class ExplainingMethod(enum.Enum):
     integrated_grad = 3
     pattern_attribution = 4
     grad_times_input = 5
+    gradcam = 6

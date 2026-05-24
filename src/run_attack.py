@@ -27,12 +27,14 @@ def main():
     argparser.add_argument('--cuda', help='enable GPU mode', action='store_true')
     argparser.add_argument('--output_dir', type=str, default='../output/', help='directory to save results to')
     argparser.add_argument('--beta_growth', help='enable beta growth', action='store_true')
+    argparser.add_argument('--beta', type=float, default=None, help='beta value for softplus')
     argparser.add_argument('--prefactors', nargs=2, default=[1e11, 1e6], type=float,
                            help='prefactors of losses (diff expls, class loss)')
     argparser.add_argument('--method', help='algorithm for expls',
                            choices=['lrp', 'guided_backprop', 'gradient', 'integrated_grad',
-                                    'pattern_attribution', 'grad_times_input'],
+                                    'pattern_attribution', 'grad_times_input', 'gradcam'],
                            default='lrp')
+    argparser.add_argument('--model_name', type=str, default='vgg16', choices=['vgg16', 'maxvit_t'])
     args = argparser.parse_args()
 
     # options
@@ -42,11 +44,21 @@ def main():
     # load model
     data_mean = np.array([0.485, 0.456, 0.406])
     data_std = np.array([0.229, 0.224, 0.225])
-    vgg_model = torchvision.models.vgg16(pretrained=True)
-    model = ExplainableNet(vgg_model, data_mean=data_mean, data_std=data_std, beta=1000 if args.beta_growth else None)
+    if args.model_name == 'vgg16':
+        model_arch = torchvision.models.vgg16(pretrained=True)
+    else:
+        model_arch = torchvision.models.maxvit_t(pretrained=True)
+
+    initial_beta = args.beta if args.beta is not None else (10.0 if args.beta_growth else None)
+    model = ExplainableNet(model_arch, data_mean=data_mean, data_std=data_std, beta=initial_beta)
     if method == ExplainingMethod.pattern_attribution:
+        if args.model_name != 'vgg16':
+            print('Pattern attribution is only available for VGG16')
+            exit()
         model.load_state_dict(torch.load('../models/model_vgg16_pattern_small.pth'), strict=False)
     model = model.eval().to(device)
+    for p in model.parameters():
+        p.requires_grad_(False)
 
     # load images
     x = load_image(data_mean, data_std, device, args.img)
@@ -54,21 +66,21 @@ def main():
     x_adv = x.clone().detach().requires_grad_()
 
     # produce expls
-    org_expl, org_acc, org_idx = get_expl(model, x, method)
+    org_expl, org_acc, org_idx = get_expl(model, x, method, create_graph=False)
     org_expl = org_expl.detach().cpu()
-    target_expl, _, _ = get_expl(model, x_target, method)
+    target_expl, _, _ = get_expl(model, x_target, method, create_graph=False)
     target_expl = target_expl.detach()
 
     optimizer = torch.optim.Adam([x_adv], lr=args.lr)
 
     for i in range(args.num_iter):
-        if args.beta_growth:
+        if args.beta_growth and args.beta is None:
             model.change_beta(get_beta(i, args.num_iter))
 
         optimizer.zero_grad()
 
         # calculate loss
-        adv_expl, adv_acc, class_idx = get_expl(model, x_adv, method, desired_index=org_idx)
+        adv_expl, adv_acc, class_idx = get_expl(model, x_adv, method, desired_index=org_idx, create_graph=True)
         loss_expl = F.mse_loss(adv_expl, target_expl)
         loss_output = F.mse_loss(adv_acc, org_acc.detach())
         total_loss = args.prefactors[0]*loss_expl + args.prefactors[1]*loss_output
@@ -86,13 +98,14 @@ def main():
         print("Iteration {}: Total Loss: {}, Expl Loss: {}, Output Loss: {}".format(i, total_loss.item(), loss_expl.item(), loss_output.item()))
 
     # test with original model (with relu activations)
-    model.change_beta(None)
-    adv_expl, adv_acc, class_idx = get_expl(model, x_adv, method)
+    model.change_beta(args.beta if args.beta is not None else None)
+    adv_expl, adv_acc, class_idx = get_expl(model, x_adv, method, create_graph=False)
 
     # save results
     output_dir = make_dir(args.output_dir)
-    plot_overview([x_target, x, x_adv], [target_expl, org_expl, adv_expl], data_mean, data_std, filename=f"{output_dir}overview_{args.method}.png")
-    torch.save(x_adv, f"{output_dir}x_{args.method}.pth")
+    beta_str = str(args.beta).replace('.', 'd') if args.beta is not None else "RELU"
+    plot_overview([x_target, x, x_adv], [target_expl, org_expl, adv_expl], data_mean, data_std, filename=f"{output_dir}overview_{args.method}_{args.model_name}_{beta_str}.png")
+    torch.save(x_adv, f"{output_dir}x_{args.method}_{args.model_name}_{beta_str}.pth")
 
 
 if __name__ == "__main__":

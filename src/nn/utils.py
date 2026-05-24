@@ -14,6 +14,78 @@ if os.environ.get('DISPLAY', '') == '':
 import matplotlib.pyplot as plt
 
 
+def _find_last_module(root, predicate):
+    last = None
+    for m in root.modules():
+        try:
+            if predicate(m):
+                last = m
+        except Exception:
+            continue
+    return last
+
+
+def _infer_gradcam_target_module(model):
+    """Infer a reasonable Grad-CAM target module.
+
+        - For MaxViT (wrapped inside ExplainableNet.layers[0]), we prefer the last MaxVitBlock output.
+            (Hooking a random late Conv2d inside attention/SE can create corner/padding artifacts.)
+        - For VGG-style ExplainableNet, we pick the last custom Convolutional layer.
+        GRADCAM IMPLEMENTATION IS GPT GENERATED!
+    """
+    # Lazy import to avoid circular deps.
+    from .networks import ExplainableNet
+    from .layers.convolutional import Convolutional
+
+    if isinstance(model, ExplainableNet):
+        # MaxViT is stored as a single torchvision module in model.layers
+        if len(model.layers) == 1 and isinstance(model.layers[0], torchvision.models.MaxVit):
+            maxvit = model.layers[0]
+            try:
+                from torchvision.models.maxvit import MaxVitBlock
+            except Exception:
+                MaxVitBlock = ()
+
+            target = _find_last_module(maxvit, lambda m: isinstance(m, MaxVitBlock))
+            if target is None:
+                target = _find_last_module(maxvit, lambda m: isinstance(m, torch.nn.Conv2d))
+            if target is not None:
+                return target
+
+        # VGG path: choose the last custom conv wrapper
+        for layer in reversed(model.layers):
+            if isinstance(layer, Convolutional):
+                return layer
+
+    # Fallback: last Conv2d in the whole model
+    target = _find_last_module(model, lambda m: isinstance(m, torch.nn.Conv2d))
+    if target is not None:
+        return target
+
+    raise RuntimeError("Could not infer a Grad-CAM target layer for the given model.")
+
+
+def _ensure_gradcam_hook(model, target_module):
+    """Attach a forward hook once and cache activation on the model."""
+    if getattr(model, "_gradcam_hook_handle", None) is not None and getattr(model, "_gradcam_target_module", None) is target_module:
+        return
+
+    # Remove any previous hook.
+    old_handle = getattr(model, "_gradcam_hook_handle", None)
+    if old_handle is not None:
+        try:
+            old_handle.remove()
+        except Exception:
+            pass
+
+    def _forward_hook(_module, _inputs, output):
+        model._gradcam_activation = output
+
+    model._gradcam_target_module = target_module
+    model._gradcam_activation = None
+    model._gradcam_hook_handle = target_module.register_forward_hook(_forward_hook)
+
+
 def plot_overview(images, heatmaps, mean, std,
                   captions=['Target Image', 'Original Image', 'Manipulated Image', 'Target Explanation', 'Original Explanation', 'Manipulated Explanation'],
                   filename="overview.png", images_per_row=3):
@@ -56,16 +128,54 @@ def clamp(x, mean, std):
     return x
 
 
-def get_expl(model, x, method, desired_index=None):
+def get_expl(model, x, method, desired_index=None, *, create_graph=False):
     """
     Helper method to get the heatmap
     """
-    x.requires_grad = True
-    acc, class_idx = model.classify(x)
+    x.requires_grad_(True)
+
+    # Grad-CAM needs a forward hook to capture a feature map, so ensure the hook is
+    # attached before running the forward pass.
+    if method == ExplainingMethod.gradcam:
+        if not hasattr(model, "_gradcam_target_module") or model._gradcam_target_module is None:
+            target_module = _infer_gradcam_target_module(model)
+            _ensure_gradcam_hook(model, target_module)
+
+    outputs = model(x)
+    acc = torch.nn.functional.softmax(outputs, dim=1)
+    class_idx = torch.max(outputs, 1)[1]
     if desired_index is None:
         desired_index = class_idx
 
-    if method == ExplainingMethod.integrated_grad:
+    # --- Universal Gradient-based methods ---
+    if method == ExplainingMethod.gradient:
+        target_output = outputs[:, int(desired_index)]
+        grad_x = torch.autograd.grad(target_output.sum(), x, create_graph=create_graph)[0]
+        heatmap = grad_x.abs()
+
+    elif method == ExplainingMethod.gradcam:
+        # Grad-CAM: use a target conv-like feature map and gradients wrt that map.
+        # This is compatible with create_graph=True so it can be used inside the attack loop.
+        target_output = outputs[:, int(desired_index)]
+        activation = getattr(model, "_gradcam_activation", None)
+        if activation is None:
+            raise RuntimeError("Grad-CAM activation was not captured; target layer may not have been executed.")
+        if activation.dim() != 4:
+            raise RuntimeError(f"Grad-CAM requires a 4D activation map (N,C,H,W), got shape {tuple(activation.shape)}")
+
+        grad_act = torch.autograd.grad(target_output.sum(), activation, create_graph=create_graph, retain_graph=create_graph)[0]
+        weights = grad_act.mean(dim=(2, 3), keepdim=True)
+        # Classic Grad-CAM uses the positive (ReLU) part.
+        cam = torch.relu((weights * activation).sum(dim=1, keepdim=True))
+        cam = torch.nn.functional.interpolate(cam, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        heatmap = cam
+
+    elif method == ExplainingMethod.grad_times_input:
+        target_output = outputs[:, int(desired_index)]
+        grad_x = torch.autograd.grad(target_output.sum(), x, create_graph=create_graph)[0]
+        heatmap = (grad_x * x).abs() # Multiply by input here
+    
+    elif method == ExplainingMethod.integrated_grad:
         # calculate the integrand in one batch
         # we use DataParallel mode of model to fit the batch in memory of (multiple) gpu(s)
         num_summands = 30
@@ -77,16 +187,30 @@ def get_expl(model, x, method, desired_index=None):
         # (d/dx) (n*y_1(1/n*x) + n/2*y_1(2/n*x) .... + y_n(x) ) = y_1'+....y'_n
         y = torch.nn.functional.softmax(y, 1)[:, int(desired_index)]
         y = (1 / num_summands) * torch.sum(y / prefactors, dim=0)
-        heatmap = torch.autograd.grad(y, x, create_graph=True)[0]
+        heatmap = torch.autograd.grad(y, x, create_graph=create_graph)[0]
+        heatmap = (heatmap * x).abs() # Multiply by input here
+
+    # --- LRP / Analyze-based methods ---
     else:
+        is_maxvit = hasattr(model, 'layers') and len(model.layers) > 0 and isinstance(model.layers[0], torchvision.models.MaxVit)
+        if is_maxvit:
+            print(f"ERROR: Method '{method.name}' is not supported for MaxVit, as it requires the 'analyze' method.")
+            print("Please use a gradient-based method like 'gradient', 'grad_times_input', 'integrated_grad', or 'gradcam'.")
+            exit(1)
+        
         heatmap = model.analyze(method=method, R=None, index=desired_index)
 
-    if method == ExplainingMethod.grad_times_input or method == ExplainingMethod.integrated_grad:
-        heatmap = heatmap * x
+    # Reduce to a 2D heatmap per sample.
+    # For Grad-CAM we keep the sign (useful for visualization with coolwarm).
+    if method == ExplainingMethod.gradcam and heatmap.dim() == 4 and heatmap.shape[1] == 1:
+        heatmap = heatmap[:, 0]
+    else:
+        heatmap = torch.sum(torch.abs(heatmap), dim=1)
 
-    heatmap = torch.sum(torch.abs(heatmap), dim=1)
-
-    normalized_heatmap = heatmap / torch.sum(heatmap)
+    # Numerical stability: for some models/methods the gradients can be (near) zero.
+    heatmap = torch.nan_to_num(heatmap, nan=0.0, posinf=0.0, neginf=0.0)
+    denom = torch.sum(torch.abs(heatmap)).clamp_min(1e-12)
+    normalized_heatmap = heatmap / denom
 
     return normalized_heatmap, acc, class_idx
 
@@ -113,7 +237,10 @@ def heatmap_to_image(heatmap):
 
     img = heatmap.squeeze().data.cpu().numpy()
 
-    img = img / np.max(np.abs(img))  # divide by maximum
+    denom = np.max(np.abs(img))
+    if denom == 0 or not np.isfinite(denom):
+        denom = 1.0
+    img = img / denom  # divide by maximum
     img = np.maximum(-1, img)
     img = np.minimum(1, img) * 0.5  # clamp to -1 and divide by two -> range [-0.5, 0.5]
     img = img + 0.5
