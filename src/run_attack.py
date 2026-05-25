@@ -27,6 +27,8 @@ def main():
     argparser.add_argument('--cuda', help='enable GPU mode', action='store_true')
     argparser.add_argument('--output_dir', type=str, default='../output/', help='directory to save results to')
     argparser.add_argument('--beta_growth', help='enable beta growth', action='store_true')
+    argparser.add_argument('--beta', type=float, default=None, help='beta value for softplus')
+    argparser.add_argument('--output-prefix', type=str, default='', help='prefix for output files')
     argparser.add_argument('--prefactors', nargs=2, default=[1e11, 1e6], type=float,
                            help='prefactors of losses (diff expls, class loss)')
     argparser.add_argument('--method', help='algorithm for expls',
@@ -43,7 +45,8 @@ def main():
     data_mean = np.array([0.485, 0.456, 0.406])
     data_std = np.array([0.229, 0.224, 0.225])
     vgg_model = torchvision.models.vgg16(pretrained=True)
-    model = ExplainableNet(vgg_model, data_mean=data_mean, data_std=data_std, beta=1000 if args.beta_growth else None)
+    initial_beta = args.beta if args.beta is not None else (10.0 if args.beta_growth else None)
+    model = ExplainableNet(vgg_model, data_mean=data_mean, data_std=data_std, beta=initial_beta)
     if method == ExplainingMethod.pattern_attribution:
         model.load_state_dict(torch.load('../models/model_vgg16_pattern_small.pth'), strict=False)
     model = model.eval().to(device)
@@ -62,7 +65,7 @@ def main():
     optimizer = torch.optim.Adam([x_adv], lr=args.lr)
 
     for i in range(args.num_iter):
-        if args.beta_growth:
+        if args.beta_growth and args.beta is None:
             model.change_beta(get_beta(i, args.num_iter))
 
         optimizer.zero_grad()
@@ -85,14 +88,15 @@ def main():
 
         print("Iteration {}: Total Loss: {}, Expl Loss: {}, Output Loss: {}".format(i, total_loss.item(), loss_expl.item(), loss_output.item()))
 
-    # test with original model (with relu activations)
-    model.change_beta(None)
+    # test with original model
+    model.change_beta(args.beta if args.beta is not None else None)
     adv_expl, adv_acc, class_idx = get_expl(model, x_adv, method)
 
     # save results
     output_dir = make_dir(args.output_dir)
-    plot_overview([x_target, x, x_adv], [target_expl, org_expl, adv_expl], data_mean, data_std, filename=f"{output_dir}overview_{args.method}.png")
-    torch.save(x_adv, f"{output_dir}x_{args.method}.pth")
+    beta_str = str(args.beta).replace('.', 'd') if args.beta is not None else "RELU"
+    plot_overview([x_target, x, x_adv], [target_expl, org_expl, adv_expl], data_mean, data_std, filename=f"{output_dir}overview_{args.output_prefix}_{args.method}_{beta_str}_{args.num_iter}.png")
+    torch.save(x_adv, f"{output_dir}x_{args.output_prefix}_{args.method}_{beta_str}_{args.num_iter}.pth")
 
 
 if __name__ == "__main__":
