@@ -16,6 +16,9 @@ def main():
     argparser.add_argument('--output_dir', type=str, default='../output/', help='directory to save results to')
     argparser.add_argument('--betas', nargs='+', help='beta values for softplus explanations', type=float,
                            default=[10, 3, 1])
+    argparser.add_argument('--index_beta', type=float, default=None,
+                           help='If set, choose the class index using Softplus with this beta (instead of ReLU). '
+                                'Useful to match heatmaps produced by run_attack.py with --beta.')
     argparser.add_argument('--method', help='algorithm for expls',
                            choices=['lrp', 'guided_backprop', 'gradient', 'integrated_grad',
                                     'pattern_attribution', 'grad_times_input'],
@@ -38,13 +41,27 @@ def main():
     # load images
     x = load_image(data_mean, data_std, device, args.img)
     if len(args.x) > 0:
-        x = torch.load(args.x).to(device)
+        x = torch.load(args.x, map_location=device)
 
     # produce expls
     expls = []
-    expl, _, org_idx = get_expl(model, x, method)
-    expls.append(expl)
-    captions = ["Image", "Expl. with ReLU"]
+    if args.index_beta is None:
+        # pick the index with ReLU (backward-compatible default)
+        expl, _, org_idx = get_expl(model, x, method)
+        expls.append(expl)
+        captions = ["Image", "Expl. with ReLU"]
+        index_source = 'ReLU'
+    else:
+        # pick the index with Softplus(beta=index_beta), then plot all heatmaps for that same index
+        model.change_beta(args.index_beta)
+        _, _, org_idx = get_expl(model, x, method)
+        model.change_beta(None)
+        expl, _, _ = get_expl(model, x, method, desired_index=org_idx)
+        expls.append(expl)
+        captions = ["Image", "Expl. with ReLU"]
+        index_source = f'softplus beta={args.index_beta}'
+
+    print(f"Using class index {int(org_idx)} (chosen with {index_source}).")
 
     for beta in args.betas:
         model.change_beta(beta)

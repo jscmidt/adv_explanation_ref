@@ -20,8 +20,8 @@ def get_beta(i, num_iter):
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument('--num_iter', type=int, default=1500, help='number of iterations')
-    argparser.add_argument('--img', type=str, default='../data/collie4.jpeg', help='image net file to run attack on')
-    argparser.add_argument('--target_img', type=str, default='../data/tiger_cat.jpeg',
+    argparser.add_argument('--img', type=str, default='../data/info.jpeg', help='image net file to run attack on')
+    argparser.add_argument('--target_img', type=str, default='../data/wein.jpeg',
                            help='imagenet file used to generate target expl')
     argparser.add_argument('--lr', type=float, default=0.0002, help='lr')
     argparser.add_argument('--cuda', help='enable GPU mode', action='store_true')
